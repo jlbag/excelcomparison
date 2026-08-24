@@ -50,7 +50,7 @@ from openpyxl.utils import get_column_letter
 SOT_NAME_COL = 1
 SOT_TYPE_COL = 3
 SOT_HEADER_ROWS = 1
-SOT_EXCLUDE_TYPE = ["baremetalhypervisor", "baremetahypervisor"]
+SOT_EXCLUDE_TYPE = ["examples"]
 SOT_EXCLUDE_PREFIX = ["abc"]
 
 EDR_NAME_COL = 1
