@@ -73,6 +73,11 @@ def squash(s):
 
 
 def matches(value, needles, mode):
+    # Drop blank entries. In "contains" mode an empty needle is a substring of
+    # every string, so one stray "" in the exclude list removes ALL rows.
+    needles = [n for n in needles if norm(n)]
+    if not needles:
+        return False
     v = norm(value).lower()
     if mode == "contains":
         sv = squash(v)
