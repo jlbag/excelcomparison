@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """
-EDR Coverage Metrics - v3
+EDR Coverage Metrics - v4
 =========================
-Clean rewrite. No tuple returns, no incremental patches, and a guard that
-makes the "letters spread across columns" failure impossible.
+v3 plus a full audit trail, so a mismatch against a manual clean can be
+diagnosed by reading the output instead of guessing.
+
+New in v4:
+  * Every processed workbook gains a "Removed" sheet listing each dropped row
+    with the exact reason - diff this against your manual removals.
+  * The report gains a "Near Misses" sheet: rows the script KEPT whose column C
+    resembles an exclude value (spacing/case/punctuation differences). This is
+    where a manual-vs-script gap almost always lives.
+  * --debug prints every distinct value in column C with row counts.
+
+KEEP YOUR SETTINGS OUT OF THIS FILE. Copy the CONFIG block into myconfig.py,
+then replace it with:  from myconfig import *
+Re-downloading this script will never clobber your values again.
 
 Outputs (your originals are never modified):
   sourceoftruth_processed.xlsx  -> Raw Data | Cleaned
@@ -39,11 +51,6 @@ SOT_NAME_COL = 1
 SOT_TYPE_COL = 3
 SOT_HEADER_ROWS = 1
 SOT_EXCLUDE_TYPE = ["baremetalhypervisor", "baremetahypervisor"]
-# "exact"    - column C must equal a value above (after trim + lowercase)
-# "contains" - matches if the value appears anywhere in the cell, ignoring
-#              spaces, dashes and underscores. Catches "BareMetal Hypervisor",
-#              "Bare-Metal Hypervisor", "baremetalhypervisor (ESXi)", etc.
-SOT_TYPE_MATCH = "contains"
 SOT_EXCLUDE_PREFIX = ["abc"]
 
 EDR_NAME_COL = 1
@@ -65,24 +72,6 @@ def norm(value):
 
 def cell(row, idx):
     return row[idx - 1] if len(row) >= idx else None
-
-
-def squash(s):
-    """Lowercase and strip spaces/dashes/underscores for tolerant matching."""
-    return norm(s).lower().replace(" ", "").replace("-", "").replace("_", "")
-
-
-def matches(value, needles, mode):
-    # Drop blank entries. In "contains" mode an empty needle is a substring of
-    # every string, so one stray "" in the exclude list removes ALL rows.
-    needles = [n for n in needles if norm(n)]
-    if not needles:
-        return False
-    v = norm(value).lower()
-    if mode == "contains":
-        sv = squash(v)
-        return any(squash(n) in sv for n in needles)
-    return v in [n.lower() for n in needles]
 
 
 def key_for(name, strip_domain):
@@ -207,6 +196,39 @@ def read_csv_grid(path, debug=False):
     return check_grid(rows, f"read of {os.path.basename(path)}")
 
 
+def loose(v):
+    """Lowercase, drop spaces/dashes/underscores/parens - for near-miss checks only.
+    This NEVER filters anything; it only flags rows for you to review."""
+    out = norm(v).lower()
+    for ch in " -_()[]./":
+        out = out.replace(ch, "")
+    return out
+
+
+def near_misses(kept_rows, col, excludes):
+    """Rows that survived exact matching but resemble an exclude value."""
+    ex = [loose(e) for e in excludes if norm(e)]
+    hits = []
+    for r in kept_rows:
+        v = norm(cell(r, col))
+        lv = loose(v)
+        if not lv or v.lower() in [e.lower() for e in excludes]:
+            continue
+        if any(e and (e in lv or lv in e) for e in ex):
+            hits.append(list(r) + [v])
+    return hits
+
+
+def profile_column(rows, header_rows, col, label):
+    from collections import Counter
+    c = Counter(norm(cell(r, col)) for r in rows[header_rows:] if any(norm(v) for v in r))
+    print(f"\n  [debug] distinct values in {label} column {get_column_letter(col)}:")
+    for val, n in c.most_common(30):
+        print(f"  [debug]    {n:6}  {val!r}")
+    if len(c) > 30:
+        print(f"  [debug]    ... {len(c)-30} more distinct values")
+
+
 def clean(rows, header_rows, rules, name_col, strip_domain, label):
     """Filter first, de-duplicate second - so an excluded duplicate never
     displaces the valid row for the same system."""
@@ -214,7 +236,7 @@ def clean(rows, header_rows, rules, name_col, strip_domain, label):
     body = [r for r in rows[header_rows:] if any(norm(v) for v in r)]
 
     stats = {"label": label, "input": len(body)}
-    kept = []
+    kept, removed = [], []
     for r in body:
         reason = None
         if norm(cell(r, name_col)) == "":
@@ -226,6 +248,7 @@ def clean(rows, header_rows, rules, name_col, strip_domain, label):
                     break
         if reason:
             stats[reason] = stats.get(reason, 0) + 1
+            removed.append(list(r) + [reason])
         else:
             kept.append(r)
 
@@ -234,13 +257,14 @@ def clean(rows, header_rows, rules, name_col, strip_domain, label):
         k = key_for(cell(r, name_col), strip_domain)
         if k in seen:
             dupes += 1
+            removed.append(list(r) + [f"duplicate of {norm(cell(r, name_col))}"])
             continue
         seen.add(k)
         out.append(r)
 
     stats["duplicates removed"] = dupes
     stats["output"] = len(out)
-    return header, out, stats
+    return header, out, stats, removed
 
 
 def write_sheet(ws, rows):
@@ -265,12 +289,14 @@ def write_sheet(ws, rows):
             c.font = BODY_FONT
 
 
-def build_workbook(path, raw_rows, header, clean_rows):
+def build_workbook(path, raw_rows, header, clean_rows, removed_rows):
     wb = Workbook()
     ws = wb.active
     ws.title = "Raw Data"
     write_sheet(ws, raw_rows)
     write_sheet(wb.create_sheet("Cleaned"), list(header) + list(clean_rows))
+    rem_hdr = (list(header[0]) if header else ["System Name"]) + ["Removed Because"]
+    write_sheet(wb.create_sheet("Removed"), [rem_hdr] + list(removed_rows))
     wb.save(path)
 
 
@@ -295,10 +321,13 @@ def main():
     sot_raw = sot["rows"]
     edr_raw = read_csv_grid(args.edr, args.debug)
 
+    if args.debug:
+        profile_column(sot_raw, SOT_HEADER_ROWS, SOT_TYPE_COL, "SoT")
+
     lower = lambda xs: [x.lower() for x in xs]
     sot_rules = [
-        {"name": f"excluded type col C ({SOT_TYPE_MATCH})",
-         "test": lambda r: matches(cell(r, SOT_TYPE_COL), SOT_EXCLUDE_TYPE, SOT_TYPE_MATCH)},
+        {"name": "excluded type col C",
+         "test": lambda r: norm(cell(r, SOT_TYPE_COL)).lower() in lower(SOT_EXCLUDE_TYPE)},
         {"name": "excluded prefix col A",
          "test": lambda r: any(norm(cell(r, SOT_NAME_COL)).lower().startswith(p.lower())
                                for p in SOT_EXCLUDE_PREFIX)},
@@ -310,10 +339,10 @@ def main():
          "test": lambda r: norm(cell(r, EDR_OTHER_COL)).lower() in lower(EDR_EXCLUDE_OTHER)},
     ]
 
-    sot_hdr, sot_clean, sot_stats = clean(sot_raw, SOT_HEADER_ROWS, sot_rules,
-                                          SOT_NAME_COL, args.strip_domain, "Source of Truth")
-    edr_hdr, edr_clean, edr_stats = clean(edr_raw, EDR_HEADER_ROWS, edr_rules,
-                                          EDR_NAME_COL, args.strip_domain, "EDR")
+    sot_hdr, sot_clean, sot_stats, sot_removed = clean(
+        sot_raw, SOT_HEADER_ROWS, sot_rules, SOT_NAME_COL, args.strip_domain, "Source of Truth")
+    edr_hdr, edr_clean, edr_stats, edr_removed = clean(
+        edr_raw, EDR_HEADER_ROWS, edr_rules, EDR_NAME_COL, args.strip_domain, "EDR")
 
     for st in (sot_stats, edr_stats):
         if st["output"] == 0 and st["input"] > 0:
@@ -325,8 +354,8 @@ def main():
 
     sot_out = os.path.join(args.outdir, "sourceoftruth_processed.xlsx")
     edr_out = os.path.join(args.outdir, "edr_processed.xlsx")
-    build_workbook(sot_out, sot_raw, sot_hdr, sot_clean)
-    build_workbook(edr_out, edr_raw, edr_hdr, edr_clean)
+    build_workbook(sot_out, sot_raw, sot_hdr, sot_clean, sot_removed)
+    build_workbook(edr_out, edr_raw, edr_hdr, edr_clean, edr_removed)
 
     edr_keys = {key_for(cell(r, EDR_NAME_COL), args.strip_domain) for r in edr_clean}
     sot_keys = {key_for(cell(r, SOT_NAME_COL), args.strip_domain) for r in sot_clean}
@@ -368,6 +397,10 @@ def main():
 
     hdr = list(sot_hdr) if sot_hdr else [["System Name"]]
     write_sheet(rb.create_sheet("Missing EDR"), hdr + missing)
+
+    nm = near_misses(sot_clean, SOT_TYPE_COL, SOT_EXCLUDE_TYPE)
+    nm_hdr = (list(sot_hdr[0]) if sot_hdr else ["System Name"]) + ["Column C value"]
+    write_sheet(rb.create_sheet("Near Misses"), [nm_hdr] + nm)
     if orphans:
         write_sheet(rb.create_sheet("EDR Not In SoT"),
                     [["System Name (EDR only)"]] + [[o] for o in orphans])
@@ -387,6 +420,10 @@ def main():
         for k, v in st.items():
             if k not in ("label", "input", "output") and v:
                 print(f"      - {k}: {v}")
+    if nm:
+        print(f"\n  *** {len(nm)} KEPT rows have a column C value resembling an exclude "
+              f"value.\n      See the 'Near Misses' sheet - this is usually the "
+              f"manual-vs-script gap.")
     print(f"\n  Systems in scope     : {total}")
     print(f"  With EDR             : {covered}")
     print(f"  MISSING EDR          : {len(missing)}")
