@@ -39,6 +39,11 @@ SOT_NAME_COL = 1
 SOT_TYPE_COL = 3
 SOT_HEADER_ROWS = 1
 SOT_EXCLUDE_TYPE = ["baremetalhypervisor", "baremetahypervisor"]
+# "exact"    - column C must equal a value above (after trim + lowercase)
+# "contains" - matches if the value appears anywhere in the cell, ignoring
+#              spaces, dashes and underscores. Catches "BareMetal Hypervisor",
+#              "Bare-Metal Hypervisor", "baremetalhypervisor (ESXi)", etc.
+SOT_TYPE_MATCH = "contains"
 SOT_EXCLUDE_PREFIX = ["abc"]
 
 EDR_NAME_COL = 1
@@ -60,6 +65,19 @@ def norm(value):
 
 def cell(row, idx):
     return row[idx - 1] if len(row) >= idx else None
+
+
+def squash(s):
+    """Lowercase and strip spaces/dashes/underscores for tolerant matching."""
+    return norm(s).lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def matches(value, needles, mode):
+    v = norm(value).lower()
+    if mode == "contains":
+        sv = squash(v)
+        return any(squash(n) in sv for n in needles)
+    return v in [n.lower() for n in needles]
 
 
 def key_for(name, strip_domain):
@@ -274,8 +292,8 @@ def main():
 
     lower = lambda xs: [x.lower() for x in xs]
     sot_rules = [
-        {"name": "excluded type col C",
-         "test": lambda r: norm(cell(r, SOT_TYPE_COL)).lower() in lower(SOT_EXCLUDE_TYPE)},
+        {"name": f"excluded type col C ({SOT_TYPE_MATCH})",
+         "test": lambda r: matches(cell(r, SOT_TYPE_COL), SOT_EXCLUDE_TYPE, SOT_TYPE_MATCH)},
         {"name": "excluded prefix col A",
          "test": lambda r: any(norm(cell(r, SOT_NAME_COL)).lower().startswith(p.lower())
                                for p in SOT_EXCLUDE_PREFIX)},
