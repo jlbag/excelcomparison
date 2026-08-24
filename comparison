@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+EDR Coverage Metrics - v3
+=========================
+Clean rewrite. No tuple returns, no incremental patches, and a guard that
+makes the "letters spread across columns" failure impossible.
+
+Outputs (your originals are never modified):
+  sourceoftruth_processed.xlsx  -> Raw Data | Cleaned
+  edr_processed.xlsx            -> Raw Data | Cleaned
+  edr_coverage_report.xlsx      -> Metrics | Missing EDR | EDR Not In SoT
+  missing_edr.csv
+
+Usage:
+  python edr_coverage_v3.py
+  python edr_coverage_v3.py --sot sourceoftruth.xlsx --edr edr.csv --outdir ./out
+  python edr_coverage_v3.py --debug           # dump what was actually read
+  python edr_coverage_v3.py --sot-sheet "Report Results"
+  python edr_coverage_v3.py --strip-domain    # match short name vs FQDN
+
+Requires: openpyxl
+"""
+
+import argparse
+import csv
+import os
+import sys
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+# ---------------------------------------------------------------------------
+# CONFIG - 1-based columns: A=1, B=2, C=3, D=4, E=5
+# ---------------------------------------------------------------------------
+SOT_NAME_COL = 1
+SOT_TYPE_COL = 3
+SOT_HEADER_ROWS = 1
+SOT_EXCLUDE_TYPE = ["baremetalhypervisor", "baremetahypervisor"]
+SOT_EXCLUDE_PREFIX = ["abc"]
+
+EDR_NAME_COL = 1
+EDR_GROUP_COL = 2
+EDR_OTHER_COL = 5
+EDR_HEADER_ROWS = 1
+EDR_EXCLUDE_GROUPS = ["group1", "group2"]
+EDR_EXCLUDE_OTHER = ["examplegroup"]
+# ---------------------------------------------------------------------------
+
+HDR_FILL = PatternFill("solid", fgColor="1F3864")
+HDR_FONT = Font(name="Arial", bold=True, color="FFFFFF")
+BODY_FONT = Font(name="Arial")
+
+
+def norm(value):
+    return "" if value is None else str(value).strip()
+
+
+def cell(row, idx):
+    return row[idx - 1] if len(row) >= idx else None
+
+
+def key_for(name, strip_domain):
+    k = norm(name).lower()
+    if strip_domain and "." in k:
+        k = k.split(".", 1)[0]
+    return k
+
+
+def safe(v):
+    """Coerce a value into something openpyxl can write."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None) if v.tzinfo else v
+    if isinstance(v, (date, time)):
+        return v.replace(tzinfo=None) if getattr(v, "tzinfo", None) else v
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, timedelta):
+        return str(v)
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "replace")
+    return str(v)
+
+
+def check_grid(rows, where):
+    """
+    A 'grid' is a list of ROWS, each row a list/tuple of CELLS.
+
+    If a bare string sneaks in as a row, iterating it yields characters and
+    every letter lands in its own column. That is the bug this guard exists
+    to make impossible - it fails loudly here instead of silently producing a
+    corrupt sheet.
+    """
+    if not isinstance(rows, list):
+        sys.exit(f"INTERNAL ERROR at {where}: expected a list of rows, "
+                 f"got {type(rows).__name__}.")
+    for i, r in enumerate(rows):
+        if isinstance(r, (str, bytes)):
+            sys.exit(f"INTERNAL ERROR at {where}: row {i} is a string "
+                     f"({r!r:.60}), not a list of cells.")
+        if not isinstance(r, (list, tuple)):
+            sys.exit(f"INTERNAL ERROR at {where}: row {i} is "
+                     f"{type(r).__name__}, not a list of cells.")
+    return rows
+
+
+def pick_sheet(path, requested, name_col, header_rows, debug=False):
+    """
+    Choose the sheet holding the data and return {'rows':..., 'sheet':...}.
+    A dict, not a tuple, so a caller cannot accidentally treat the sheet name
+    as data.
+    """
+    wb = load_workbook(path, data_only=True)
+    names = wb.sheetnames
+
+    if requested:
+        if requested not in names:
+            sys.exit(f"ERROR: sheet '{requested}' not in {path}.\n"
+                     f"       Available: {names}")
+        candidates = [requested]
+    else:
+        visible = [ws.title for ws in wb.worksheets if ws.sheet_state == "visible"]
+        candidates = visible + [n for n in names if n not in visible]
+
+    def grab(book, title):
+        return [list(r) for r in book[title].iter_rows(values_only=True)]
+
+    def count(rows):
+        return sum(1 for r in rows[header_rows:]
+                   if len(r) >= name_col and norm(r[name_col - 1]) != "")
+
+    if debug:
+        print(f"\n  [debug] {path}")
+        print(f"  [debug] sheets: {names}")
+
+    best_rows, best_name, best_n = [], None, 0
+    for t in candidates:
+        rows = grab(wb, t)
+        n = count(rows)
+        if debug:
+            print(f"  [debug]   '{t}': {len(rows)} rows, "
+                  f"{n} populated in col {get_column_letter(name_col)}")
+        if n > best_n:
+            best_rows, best_name, best_n = rows, t, n
+
+    if best_n == 0:
+        formulas = load_workbook(path, data_only=False)
+        for t in candidates:
+            if count(grab(formulas, t)) > 0:
+                sys.exit(
+                    f"ERROR: column {get_column_letter(name_col)} of sheet '{t}' holds "
+                    f"FORMULAS with no saved values, so it reads as empty.\n"
+                    f"       Fix: open {path} in Excel, select that column, Copy, "
+                    f"Paste Special > Values, save, re-run.")
+        sys.exit(f"ERROR: no data in column {get_column_letter(name_col)} on any sheet "
+                 f"of {path}.\n       Sheets: {names}\n"
+                 f"       Check --sot-sheet, SOT_NAME_COL, SOT_HEADER_ROWS.")
+
+    if not requested and best_name != wb.worksheets[0].title:
+        print(f"  NOTE: reading sheet '{best_name}' (sheet index 0 is "
+              f"'{wb.worksheets[0].title}', empty in column "
+              f"{get_column_letter(name_col)})")
+
+    check_grid(best_rows, f"read of {os.path.basename(path)}")
+    return {"rows": best_rows, "sheet": best_name}
+
+
+def read_csv_grid(path, debug=False):
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        sample = fh.read(8192)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = [list(r) for r in csv.reader(fh, dialect)]
+    if debug:
+        print(f"\n  [debug] {path}: {len(rows)} rows, "
+              f"first row {len(rows[0]) if rows else 0} columns")
+    return check_grid(rows, f"read of {os.path.basename(path)}")
+
+
+def clean(rows, header_rows, rules, name_col, strip_domain, label):
+    """Filter first, de-duplicate second - so an excluded duplicate never
+    displaces the valid row for the same system."""
+    header = rows[:header_rows]
+    body = [r for r in rows[header_rows:] if any(norm(v) for v in r)]
+
+    stats = {"label": label, "input": len(body)}
+    kept = []
+    for r in body:
+        reason = None
+        if norm(cell(r, name_col)) == "":
+            reason = "blank name"
+        else:
+            for rule in rules:
+                if rule["test"](r):
+                    reason = rule["name"]
+                    break
+        if reason:
+            stats[reason] = stats.get(reason, 0) + 1
+        else:
+            kept.append(r)
+
+    seen, out, dupes = set(), [], 0
+    for r in kept:
+        k = key_for(cell(r, name_col), strip_domain)
+        if k in seen:
+            dupes += 1
+            continue
+        seen.add(k)
+        out.append(r)
+
+    stats["duplicates removed"] = dupes
+    stats["output"] = len(out)
+    return header, out, stats
+
+
+def write_sheet(ws, rows):
+    check_grid(rows, f"write to sheet '{ws.title}'")
+    for r in rows:
+        ws.append([safe(v) for v in r])
+    if ws.max_row >= 1:
+        for c in ws[1]:
+            c.fill = HDR_FILL
+            c.font = HDR_FONT
+        ws.freeze_panes = "A2"
+    widths = {}
+    for row in ws.iter_rows(max_row=min(ws.max_row, 500)):
+        for c in row:
+            if c.value is not None:
+                widths[c.column] = min(max(widths.get(c.column, 12),
+                                           len(str(c.value)) + 2), 55)
+    for col, w in widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
+    for row in ws.iter_rows(min_row=2):
+        for c in row:
+            c.font = BODY_FONT
+
+
+def build_workbook(path, raw_rows, header, clean_rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Raw Data"
+    write_sheet(ws, raw_rows)
+    write_sheet(wb.create_sheet("Cleaned"), list(header) + list(clean_rows))
+    wb.save(path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="EDR coverage metrics")
+    ap.add_argument("--sot", default="sourceoftruth.xlsx")
+    ap.add_argument("--edr", default="edr.csv")
+    ap.add_argument("--outdir", default=".")
+    ap.add_argument("--sot-sheet", default=None)
+    ap.add_argument("--strip-domain", action="store_true")
+    ap.add_argument("--debug", action="store_true",
+                    help="print what was read from each sheet")
+    args = ap.parse_args()
+
+    for p in (args.sot, args.edr):
+        if not os.path.exists(p):
+            sys.exit(f"ERROR: file not found: {p}")
+    os.makedirs(args.outdir, exist_ok=True)
+
+    sot = pick_sheet(args.sot, args.sot_sheet, SOT_NAME_COL,
+                     SOT_HEADER_ROWS, args.debug)
+    sot_raw = sot["rows"]
+    edr_raw = read_csv_grid(args.edr, args.debug)
+
+    lower = lambda xs: [x.lower() for x in xs]
+    sot_rules = [
+        {"name": "excluded type col C",
+         "test": lambda r: norm(cell(r, SOT_TYPE_COL)).lower() in lower(SOT_EXCLUDE_TYPE)},
+        {"name": "excluded prefix col A",
+         "test": lambda r: any(norm(cell(r, SOT_NAME_COL)).lower().startswith(p.lower())
+                               for p in SOT_EXCLUDE_PREFIX)},
+    ]
+    edr_rules = [
+        {"name": "excluded group col B",
+         "test": lambda r: norm(cell(r, EDR_GROUP_COL)).lower() in lower(EDR_EXCLUDE_GROUPS)},
+        {"name": "excluded value col E",
+         "test": lambda r: norm(cell(r, EDR_OTHER_COL)).lower() in lower(EDR_EXCLUDE_OTHER)},
+    ]
+
+    sot_hdr, sot_clean, sot_stats = clean(sot_raw, SOT_HEADER_ROWS, sot_rules,
+                                          SOT_NAME_COL, args.strip_domain, "Source of Truth")
+    edr_hdr, edr_clean, edr_stats = clean(edr_raw, EDR_HEADER_ROWS, edr_rules,
+                                          EDR_NAME_COL, args.strip_domain, "EDR")
+
+    for st in (sot_stats, edr_stats):
+        if st["output"] == 0 and st["input"] > 0:
+            print(f"\n  WARNING: cleaning removed every row of {st['label']}:")
+            for k, v in st.items():
+                if k not in ("label", "input", "output") and v:
+                    print(f"      {k}: {v}")
+            print("      Metrics will be 0. Re-run with --debug.\n")
+
+    sot_out = os.path.join(args.outdir, "sourceoftruth_processed.xlsx")
+    edr_out = os.path.join(args.outdir, "edr_processed.xlsx")
+    build_workbook(sot_out, sot_raw, sot_hdr, sot_clean)
+    build_workbook(edr_out, edr_raw, edr_hdr, edr_clean)
+
+    edr_keys = {key_for(cell(r, EDR_NAME_COL), args.strip_domain) for r in edr_clean}
+    sot_keys = {key_for(cell(r, SOT_NAME_COL), args.strip_domain) for r in sot_clean}
+    missing = [r for r in sot_clean
+               if key_for(cell(r, SOT_NAME_COL), args.strip_domain) not in edr_keys]
+    orphans = sorted(k for k in edr_keys if k not in sot_keys)
+
+    total = len(sot_clean)
+    covered = total - len(missing)
+    pct = covered / total * 100 if total else 0.0
+
+    rb = Workbook()
+    m = rb.active
+    m.title = "Metrics"
+    report_rows = [
+        ["Metric", "Value"],
+        ["Generated", datetime.now().strftime("%Y-%m-%d %H:%M")],
+        ["Source of truth", os.path.abspath(args.sot)],
+        ["Sheet used", sot["sheet"]],
+        ["EDR export", os.path.abspath(args.edr)],
+        ["Name matching", "short hostname" if args.strip_domain else "exact (case-insensitive)"],
+        ["", ""],
+        ["Systems in scope (cleaned SoT)", total],
+        ["Systems with EDR", covered],
+        ["Systems MISSING EDR", len(missing)],
+        ["Coverage %", round(pct, 1)],
+        ["EDR agents not in SoT", len(orphans)],
+        ["", ""],
+    ]
+    for st in (sot_stats, edr_stats):
+        report_rows.append([f"--- {st['label']} ---", ""])
+        report_rows.append(["Rows read (excl. header)", st["input"]])
+        report_rows += [[k, v] for k, v in st.items()
+                        if k not in ("label", "input", "output")]
+        report_rows.append(["Rows after cleaning", st["output"]])
+    write_sheet(m, report_rows)
+    m.column_dimensions["A"].width = 42
+    m.column_dimensions["B"].width = 60
+
+    hdr = list(sot_hdr) if sot_hdr else [["System Name"]]
+    write_sheet(rb.create_sheet("Missing EDR"), hdr + missing)
+    if orphans:
+        write_sheet(rb.create_sheet("EDR Not In SoT"),
+                    [["System Name (EDR only)"]] + [[o] for o in orphans])
+
+    report = os.path.join(args.outdir, "edr_coverage_report.xlsx")
+    rb.save(report)
+
+    csv_out = os.path.join(args.outdir, "missing_edr.csv")
+    with open(csv_out, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(list(sot_hdr[0]) if sot_hdr else ["System Name"])
+        w.writerows(missing)
+
+    print("\n=== EDR COVERAGE ===")
+    for st in (sot_stats, edr_stats):
+        print(f"  {st['label']}: {st['input']} rows in -> {st['output']} out")
+        for k, v in st.items():
+            if k not in ("label", "input", "output") and v:
+                print(f"      - {k}: {v}")
+    print(f"\n  Systems in scope     : {total}")
+    print(f"  With EDR             : {covered}")
+    print(f"  MISSING EDR          : {len(missing)}")
+    print(f"  Coverage             : {pct:.1f}%")
+    print(f"  EDR-only (not in SoT): {len(orphans)}")
+    if missing:
+        print("\n  Missing systems:")
+        for r in missing[:25]:
+            print(f"      {norm(cell(r, SOT_NAME_COL))}")
+        if len(missing) > 25:
+            print(f"      ... and {len(missing)-25} more (see {csv_out})")
+    print(f"\n  Wrote: {sot_out}\n         {edr_out}\n         {report}\n         {csv_out}\n")
+
+
+if __name__ == "__main__":
+    main()
