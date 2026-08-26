@@ -20,15 +20,17 @@ Re-downloading this script will never clobber your values again.
 Outputs (your originals are never modified):
   sourceoftruth_processed.xlsx  -> Raw Data | Cleaned
   edr_processed.xlsx            -> Raw Data | Cleaned
-  edr_coverage_report.xlsx      -> Metrics | Missing EDR | EDR Not In SoT
-  missing_edr.csv
+  edr_coverage_report.xlsx      -> Metrics | Missing EDR | Near Misses
+                                   | EDR Not In SoT
+  missing_edr.csv               -> in SoT, no EDR agent
+  edr_only_not_in_sot.csv       -> has EDR agent, absent from SoT
 
 Usage:
-  python edr_coverage_v3.py
-  python edr_coverage_v3.py --sot sourceoftruth.xlsx --edr edr.csv --outdir ./out
-  python edr_coverage_v3.py --debug           # dump what was actually read
-  python edr_coverage_v3.py --sot-sheet "Report Results"
-  python edr_coverage_v3.py --strip-domain    # match short name vs FQDN
+  python edr_coverage_v5.py
+  python edr_coverage_v5.py --sot sourceoftruth.xlsx --edr edr.csv --outdir ./out
+  python edr_coverage_v5.py --debug           # dump what was actually read
+  python edr_coverage_v5.py --sot-sheet "Report Results"
+  python edr_coverage_v5.py --strip-domain    # match short name vs FQDN
 
 Requires: openpyxl
 """
@@ -50,7 +52,7 @@ from openpyxl.utils import get_column_letter
 SOT_NAME_COL = 1
 SOT_TYPE_COL = 3
 SOT_HEADER_ROWS = 1
-SOT_EXCLUDE_TYPE = ["examples"]
+SOT_EXCLUDE_TYPE = ["example"]
 SOT_EXCLUDE_PREFIX = ["abc"]
 
 EDR_NAME_COL = 1
@@ -362,6 +364,11 @@ def main():
     missing = [r for r in sot_clean
                if key_for(cell(r, SOT_NAME_COL), args.strip_domain) not in edr_keys]
     orphans = sorted(k for k in edr_keys if k not in sot_keys)
+    # Full EDR rows for systems with an agent but no source-of-truth record.
+    # Uses the row itself rather than the lowercased match key, so every
+    # column from edr.csv (group, version, last seen) comes through.
+    edr_only = [r for r in edr_clean
+                if key_for(cell(r, EDR_NAME_COL), args.strip_domain) not in sot_keys]
 
     total = len(sot_clean)
     covered = total - len(missing)
@@ -401,9 +408,8 @@ def main():
     nm = near_misses(sot_clean, SOT_TYPE_COL, SOT_EXCLUDE_TYPE)
     nm_hdr = (list(sot_hdr[0]) if sot_hdr else ["System Name"]) + ["Column C value"]
     write_sheet(rb.create_sheet("Near Misses"), [nm_hdr] + nm)
-    if orphans:
-        write_sheet(rb.create_sheet("EDR Not In SoT"),
-                    [["System Name (EDR only)"]] + [[o] for o in orphans])
+    edr_only_hdr = list(edr_hdr[0]) if edr_hdr else ["System Name"]
+    write_sheet(rb.create_sheet("EDR Not In SoT"), [edr_only_hdr] + edr_only)
 
     report = os.path.join(args.outdir, "edr_coverage_report.xlsx")
     rb.save(report)
@@ -413,6 +419,12 @@ def main():
         w = csv.writer(fh)
         w.writerow(list(sot_hdr[0]) if sot_hdr else ["System Name"])
         w.writerows(missing)
+
+    edr_only_csv = os.path.join(args.outdir, "edr_only_not_in_sot.csv")
+    with open(edr_only_csv, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(edr_only_hdr)
+        w.writerows(edr_only)
 
     print("\n=== EDR COVERAGE ===")
     for st in (sot_stats, edr_stats):
@@ -435,7 +447,14 @@ def main():
             print(f"      {norm(cell(r, SOT_NAME_COL))}")
         if len(missing) > 25:
             print(f"      ... and {len(missing)-25} more (see {csv_out})")
-    print(f"\n  Wrote: {sot_out}\n         {edr_out}\n         {report}\n         {csv_out}\n")
+    if edr_only:
+        print("\n  EDR agents with no source-of-truth record:")
+        for r in edr_only[:25]:
+            print(f"      {norm(cell(r, EDR_NAME_COL))}")
+        if len(edr_only) > 25:
+            print(f"      ... and {len(edr_only)-25} more (see {edr_only_csv})")
+    print(f"\n  Wrote: {sot_out}\n         {edr_out}\n         {report}"
+          f"\n         {csv_out}\n         {edr_only_csv}\n")
 
 
 if __name__ == "__main__":
